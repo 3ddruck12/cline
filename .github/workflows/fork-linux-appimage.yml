@@ -1,9 +1,10 @@
 name: fork-linux-appimage
 
-# Unofficial Linux Type 2 AppImage for this fork. GitHub only runs `schedule`
-# from the default branch, so this file must stay on 3ddruck12/cline main.
-# Every 12 hours it looks at cline/cline for a new stable desktop-vX.Y.Z tag
-# and rebuilds if this fork does not already have linux-appimage-vX.Y.Z.
+# Unofficial Linux Type 2 AppImages for this fork (x64 + aarch64).
+# GitHub only runs `schedule` from the default branch, so this file must
+# stay on 3ddruck12/cline main. Every 12 hours it looks at cline/cline
+# for a new stable desktop-vX.Y.Z tag and rebuilds if this fork does not
+# already have linux-appimage-vX.Y.Z.
 on:
   schedule:
     - cron: "0 6,18 * * *"
@@ -13,9 +14,6 @@ on:
         description: "Rebuild even if this version was already released"
         type: boolean
         default: false
-  push:
-    branches:
-      - fork-linux-appimage-release
 
 concurrency:
   group: fork-linux-appimage-${{ github.event_name }}
@@ -38,7 +36,7 @@ jobs:
         id: version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || github.event_name == 'push' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
         run: |
           set -euo pipefail
           TAG=$(gh api --paginate repos/cline/cline/git/matching-refs/tags/desktop-v \
@@ -64,12 +62,26 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-  build-and-release:
-    name: Build Linux AppImage and release
+  build:
+    name: Build Linux ${{ matrix.arch }} AppImage
     needs: decide
     if: github.repository == '3ddruck12/cline' && needs.decide.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+            appimagetool: appimagetool-x86_64.AppImage
+            runtime: runtime-x86_64
+            tool_arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+            appimagetool: appimagetool-aarch64.AppImage
+            runtime: runtime-aarch64
+            tool_arch: aarch64
     env:
       NO_STRIP: "true"
       APPIMAGE_EXTRACT_AND_RUN: "1"
@@ -141,11 +153,14 @@ jobs:
         run: bunx tauri build --bundles appimage --verbose
 
       - name: Repack as AppImage Type 2
-        id: artifact
         working-directory: apps/examples/desktop-app
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           VERSION: ${{ needs.decide.outputs.version }}
+          TOOL_ARCH: ${{ matrix.tool_arch }}
+          APPIMAGETOOL: ${{ matrix.appimagetool }}
+          RUNTIME: ${{ matrix.runtime }}
+          ARCH_SUFFIX: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           BUNDLE_DIR="src-tauri/target/release/bundle/appimage"
@@ -159,19 +174,19 @@ jobs:
           TOOLS="$RUNNER_TEMP/appimage-type2"
           mkdir -p "$TOOLS"
           curl -fsSL -o "$TOOLS/appimagetool" \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          curl -fsSL -o "$TOOLS/runtime-x86_64" \
-            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/${APPIMAGETOOL}"
+          curl -fsSL -o "$TOOLS/runtime" \
+            "https://github.com/AppImage/type2-runtime/releases/download/continuous/${RUNTIME}"
           chmod +x "$TOOLS/appimagetool"
 
           OUT="dist/publish"
           mkdir -p "$OUT"
-          NAME="Cline_${VERSION}_amd64.AppImage"
+          NAME="Cline_${VERSION}_${ARCH_SUFFIX}.AppImage"
           DEST="$OUT/$NAME"
 
-          ARCH=x86_64 "$TOOLS/appimagetool" \
+          ARCH="$TOOL_ARCH" "$TOOLS/appimagetool" \
             --no-appstream \
-            --runtime-file "$TOOLS/runtime-x86_64" \
+            --runtime-file "$TOOLS/runtime" \
             "$APPDIR" \
             "$DEST"
           chmod +x "$DEST"
@@ -184,40 +199,66 @@ jobs:
           fi
 
           ls -lh "$DEST"
-          echo "file=${DEST}" >> "$GITHUB_OUTPUT"
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-linux-x64
+          name: desktop-linux-${{ matrix.arch }}
           retention-days: 30
           path: apps/examples/desktop-app/dist/publish/*
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - decide
+      - build
+    if: github.repository == '3ddruck12/cline' && needs.decide.outputs.should_build == 'true' && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download AppImages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/desktop
+          merge-multiple: true
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.decide.outputs.version }}
           TAG: ${{ needs.decide.outputs.tag }}
-          FILE: apps/examples/desktop-app/${{ steps.artifact.outputs.file }}
-          NAME: ${{ steps.artifact.outputs.name }}
         run: |
-          RELEASE="linux-appimage-v${VERSION}"
-          if gh release view "$RELEASE" >/dev/null 2>&1; then
-            gh release delete "$RELEASE" --yes --cleanup-tag
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(dist/desktop/*.AppImage)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "no AppImage artifacts downloaded"
+            ls -la dist/desktop || true
+            exit 1
           fi
-          gh release create "$RELEASE" "$FILE" \
-            --title "Cline Desktop Linux AppImage v${VERSION}" \
-            --notes "$(cat <<EOF
-          Unofficial Linux x64 Type 2 AppImage (static type2-runtime, no libfuse2).
+          RELEASE="linux-appimage-v${VERSION}"
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$RELEASE" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          NOTES=$(cat <<EOF
+          Unofficial Linux Type 2 AppImages (static type2-runtime, no libfuse2).
 
           Built from official tag [\`${TAG}\`](https://github.com/cline/cline/releases/tag/${TAG}).
           This is **not** an official Cline release.
 
+          | File | Arch |
+          | --- | --- |
+          | \`Cline_${VERSION}_amd64.AppImage\` | x86_64 |
+          | \`Cline_${VERSION}_aarch64.AppImage\` | ARM64 |
+
           \`\`\`bash
-          chmod +x ${NAME}
-          ./${NAME}
+          chmod +x Cline_${VERSION}_amd64.AppImage
+          ./Cline_${VERSION}_amd64.AppImage
           \`\`\`
           EOF
-          )"
+          )
+          gh release create "$RELEASE" "${FILES[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Cline Desktop Linux AppImage v${VERSION}" \
+            --notes "$NOTES"
+          ls -lh "${FILES[@]}"
