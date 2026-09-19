@@ -1,0 +1,204 @@
+name: fork-linux-appimage
+
+# Unofficial Linux Type 2 AppImage for this fork. GitHub only runs `schedule`
+# from the default branch, so this file must stay on 3ddruck12/cline main.
+# Every 12 hours it looks at cline/cline for a new stable desktop-vX.Y.Z tag
+# and rebuilds if this fork does not already have linux-appimage-vX.Y.Z.
+on:
+  schedule:
+    - cron: "0 6,18 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if this version was already released"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - fork-linux-appimage-release
+
+concurrency:
+  group: fork-linux-appimage-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  decide:
+    name: Detect new upstream desktop version
+    if: github.repository == '3ddruck12/cline'
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.version.outputs.should_build }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve latest stable desktop tag
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api --paginate repos/cline/cline/git/matching-refs/tags/desktop-v \
+            --jq '.[].ref' \
+            | sed 's|^refs/tags/||' \
+            | grep -E '^desktop-v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -1)
+          if [ -z "$TAG" ]; then
+            echo "no stable desktop-vX.Y.Z tag found on cline/cline"
+            exit 1
+          fi
+          VERSION="${TAG#desktop-v}"
+          echo "Latest official desktop tag: ${TAG}"
+
+          SHOULD_BUILD=true
+          if [ "$FORCE" != "true" ] && gh release view "linux-appimage-v${VERSION}" >/dev/null 2>&1; then
+            echo "Fork already has linux-appimage-v${VERSION}; skipping."
+            SHOULD_BUILD=false
+          fi
+
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    name: Build Linux AppImage and release
+    needs: decide
+    if: github.repository == '3ddruck12/cline' && needs.decide.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout official desktop tag
+        uses: actions/checkout@v4
+        with:
+          repository: cline/cline
+          ref: ${{ needs.decide.outputs.tag }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.13"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/examples/desktop-app/src-tauri -> target
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            upx-ucl \
+            wget
+
+      - name: Install dependencies
+        run: bun install
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build SDK packages
+        run: bun run build:sdk
+
+      - name: Build AppImage
+        working-directory: apps/examples/desktop-app
+        run: bunx tauri build --bundles appimage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+
+      - name: Repack as AppImage Type 2
+        id: artifact
+        working-directory: apps/examples/desktop-app
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/release/bundle/appimage"
+          APPDIR=$(find "$BUNDLE_DIR" -maxdepth 1 -type d -name '*.AppDir' -print -quit)
+          if [ -z "$APPDIR" ]; then
+            echo "no AppDir produced under $BUNDLE_DIR"
+            find "$BUNDLE_DIR" -maxdepth 2 | head -50
+            exit 1
+          fi
+
+          TOOLS="$RUNNER_TEMP/appimage-type2"
+          mkdir -p "$TOOLS"
+          curl -fsSL -o "$TOOLS/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -fsSL -o "$TOOLS/runtime-x86_64" \
+            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+          chmod +x "$TOOLS/appimagetool"
+
+          OUT="dist/publish"
+          mkdir -p "$OUT"
+          NAME="Cline_${VERSION}_amd64.AppImage"
+          DEST="$OUT/$NAME"
+
+          ARCH=x86_64 "$TOOLS/appimagetool" \
+            --no-appstream \
+            --runtime-file "$TOOLS/runtime-x86_64" \
+            "$APPDIR" \
+            "$DEST"
+          chmod +x "$DEST"
+
+          MAGIC=$(od -An -tx1 -N 3 -j 8 "$DEST" | tr -d ' \n')
+          echo "AppImage magic at offset 8: $MAGIC"
+          if [ "$MAGIC" != "414902" ]; then
+            echo "expected Type 2 magic 41 49 02, got $MAGIC"
+            exit 1
+          fi
+
+          ls -lh "$DEST"
+          echo "file=${DEST}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-linux-x64
+          retention-days: 30
+          path: apps/examples/desktop-app/dist/publish/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.decide.outputs.version }}
+          TAG: ${{ needs.decide.outputs.tag }}
+          FILE: apps/examples/desktop-app/${{ steps.artifact.outputs.file }}
+          NAME: ${{ steps.artifact.outputs.name }}
+        run: |
+          RELEASE="linux-appimage-v${VERSION}"
+          if gh release view "$RELEASE" >/dev/null 2>&1; then
+            gh release delete "$RELEASE" --yes --cleanup-tag
+          fi
+          gh release create "$RELEASE" "$FILE" \
+            --title "Cline Desktop Linux AppImage v${VERSION}" \
+            --notes "$(cat <<EOF
+          Unofficial Linux x64 Type 2 AppImage (static type2-runtime, no libfuse2).
+
+          Built from official tag [\`${TAG}\`](https://github.com/cline/cline/releases/tag/${TAG}).
+          This is **not** an official Cline release.
+
+          \`\`\`bash
+          chmod +x ${NAME}
+          ./${NAME}
+          \`\`\`
+          EOF
+          )"
