@@ -118,6 +118,24 @@ jobs:
       - name: Build SDK packages
         run: bun run build:sdk
 
+      - name: Ignore ldd on Bun sidecar binaries
+        run: |
+          sudo mv /usr/bin/ldd /usr/bin/ldd.real
+          sudo tee /usr/bin/ldd >/dev/null <<'EOF'
+          #!/bin/bash
+          for arg in "$@"; do
+            [ -f "$arg" ] || continue
+            case "$(basename -- "$arg")" in
+              code-sidecar|code-sidecar-*|cline-remote-helper-*)
+                printf '\tnot a dynamic executable\n'
+                exit 0
+                ;;
+            esac
+          done
+          exec /usr/bin/ldd.real "$@"
+          EOF
+          sudo chmod 755 /usr/bin/ldd
+
       - name: Build AppImage
         working-directory: apps/examples/desktop-app
         run: bunx tauri build --bundles appimage --verbose
