@@ -70,6 +70,9 @@ jobs:
     if: github.repository == '3ddruck12/cline' && needs.decide.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      NO_STRIP: "true"
+      APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       - name: Checkout official desktop tag
         uses: actions/checkout@v4
@@ -117,9 +120,7 @@ jobs:
 
       - name: Build AppImage
         working-directory: apps/examples/desktop-app
-        run: bunx tauri build --bundles appimage
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: bunx tauri build --bundles appimage --verbose
 
       - name: Repack as AppImage Type 2
         id: artifact
